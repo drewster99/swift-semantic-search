@@ -117,8 +117,9 @@ public actor SemanticSearchEngine {
             return
         }
 
-        let loadTask = Task<MLXEmbedderBackend, Error> { [self] in
-            try await self.performLoad(continuation: continuation)
+        let loadTask = Task<MLXEmbedderBackend, Error> { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await self.performLoad(continuation: continuation)
         }
         internalState = .loading(loadTask)
 

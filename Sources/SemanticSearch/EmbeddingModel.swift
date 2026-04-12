@@ -21,9 +21,6 @@ public struct EmbeddingModel: Sendable, Hashable {
     /// HuggingFace repository, e.g. `"mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"`.
     public let huggingFaceRepo: String
 
-    /// Pinned revision (branch name, tag, or commit SHA). Defaults to `"main"`.
-    public let revision: String
-
     /// Subdirectory inside `Bundle.main` where this model may be found pre-bundled.
     /// `SemanticSearchEngine` checks this location first; if present, no download
     /// is required and the model loads from the bundle.
@@ -34,14 +31,12 @@ public struct EmbeddingModel: Sendable, Hashable {
         displayName: String,
         dimension: Int,
         huggingFaceRepo: String,
-        revision: String = "main",
         bundleSubdirectory: String
     ) {
         self.identifier = identifier
         self.displayName = displayName
         self.dimension = dimension
         self.huggingFaceRepo = huggingFaceRepo
-        self.revision = revision
         self.bundleSubdirectory = bundleSubdirectory
     }
 }
@@ -53,7 +48,6 @@ extension EmbeddingModel {
         displayName: "Qwen3 Embedding 0.6B (4-bit DWQ)",
         dimension: 1024,
         huggingFaceRepo: "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
-        revision: "main",
         bundleSubdirectory: "Models/qwen3-embedding-0.6b-4bit-dwq"
     )
 

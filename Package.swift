@@ -13,7 +13,10 @@ let package = Package(
         .library(name: "SemanticSearch", targets: ["SemanticSearch"])
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.29.2")
+        // Pinned tightly: mlx-swift-lm has rewritten the MLXEmbedders public API on
+        // its main branch (loadModelContainer now takes Downloader/TokenizerLoader
+        // instead of HubApi). Stay on 2.29.x until we explicitly migrate.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "2.29.2"))
     ],
     targets: [
         .target(
