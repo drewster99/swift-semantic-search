@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXEmbedders
+import MLXLinalg
 import Tokenizers
 
 /// MLX-backed embedding backend. Wraps a loaded `MLXEmbedders.ModelContainer`
@@ -67,35 +68,39 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
         }
     }
 
-    /// Extracts `[Float]` vectors from a pooled MLX tensor. Handles both 2D
-    /// `(batch, dim)` outputs (last-token / mean / cls poolers) and 3D
-    /// `(batch, seq, dim)` outputs (per-token sequences), mean-pooling across the
-    /// sequence axis in the 3D case.
+    /// Extracts `[Float]` vectors from a pooled MLX tensor and L2-normalizes them
+    /// at the sentence level so the API contract (unit-length sentence embeddings)
+    /// holds regardless of the pooling strategy. Handles both 2D `(batch, dim)`
+    /// outputs and 3D `(batch, seq, dim)` outputs — in the 3D case we mean-pool
+    /// across the sequence axis first.
+    ///
+    /// The separate L2 pass matters because the MLX pooler's `normalize: true`
+    /// flag is applied *before* our Swift-side mean pooling in the 3D case: each
+    /// token is unit-normalized, but averaging them does not preserve unit norm.
+    /// Models that ship without a `1_Pooling/config.json` (such as the default
+    /// Qwen3 embedding repo) fall through to that 3D path.
     private static func extractVectors(from array: MLXArray, expectedCount: Int) throws -> [[Float]] {
         let shape = array.shape
+        let pooled: MLXArray
         switch shape.count {
         case 2:
-            let vectors = array.map { $0.asArray(Float.self) }
-            guard vectors.count == expectedCount else {
-                throw SemanticSearchError.unexpectedVectorCount(
-                    expected: expectedCount,
-                    received: vectors.count
-                )
-            }
-            return vectors
+            pooled = array
         case 3:
-            let reduced = mean(array, axis: 1)
-            reduced.eval()
-            let vectors = reduced.map { $0.asArray(Float.self) }
-            guard vectors.count == expectedCount else {
-                throw SemanticSearchError.unexpectedVectorCount(
-                    expected: expectedCount,
-                    received: vectors.count
-                )
-            }
-            return vectors
+            pooled = mean(array, axis: 1)
         default:
             throw SemanticSearchError.unsupportedPoolingShape(shape)
         }
+
+        let normalized = pooled / MLX.maximum(norm(pooled, axis: -1, keepDims: true), MLXArray(1e-12))
+        normalized.eval()
+
+        let vectors = normalized.map { $0.asArray(Float.self) }
+        guard vectors.count == expectedCount else {
+            throw SemanticSearchError.unexpectedVectorCount(
+                expected: expectedCount,
+                received: vectors.count
+            )
+        }
+        return vectors
     }
 }
