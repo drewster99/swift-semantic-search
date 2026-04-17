@@ -29,7 +29,10 @@ let package = Package(
         .testTarget(
             name: "SemanticSearchTests",
             dependencies: ["SemanticSearch"],
-            path: "Tests/SemanticSearchTests"
+            path: "Tests/SemanticSearchTests",
+            resources: [
+                .process("Fixtures")
+            ]
         )
     ]
 )
