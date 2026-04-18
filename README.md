@@ -59,6 +59,30 @@ await engine.unload()
 try await engine.deleteDownloadedWeights()
 ```
 
+## Running the tests
+
+The pure-logic `VectorMath` tests run anywhere:
+
+```sh
+swift test --filter VectorMath
+```
+
+The end-to-end `Integration` suite loads the real MLX model and exercises
+`prepare()` + `embed()` + `match()` against a curated corpus. It must be run
+through Xcode's build pipeline — `swift test` on its own cannot compile MLX's
+Metal shaders, so the metallib isn't present at runtime:
+
+```sh
+xcodebuild test \
+    -scheme SemanticSearch \
+    -destination 'platform=macOS' \
+    -only-testing:SemanticSearchTests/SemanticSearchIntegrationTests
+```
+
+The first run downloads the default Qwen3 embedding weights (~330 MB) into the
+test host's Application Support cache; subsequent runs reuse the cache and
+finish in a few seconds.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
