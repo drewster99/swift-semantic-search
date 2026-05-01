@@ -50,6 +50,19 @@ public actor SemanticSearchEngine {
         self.locator = ModelLocator(model: model)
     }
 
+    /// On-disk location of the model files, if the engine can find them.
+    /// Returns the bundled URL if the model is shipped inside the host app,
+    /// the cache URL once the model has been downloaded, or `nil` if no copy
+    /// exists on disk yet. Cheap — does not load anything.
+    public nonisolated func modelLocationOnDisk() -> URL? {
+        switch locator.locate() {
+        case .bundled(let url), .downloaded(let url):
+            return url
+        case .absent:
+            return nil
+        }
+    }
+
     /// Current public state. Cheap — does not load anything.
     public var state: ModelState {
         switch internalState {
@@ -83,6 +96,7 @@ public actor SemanticSearchEngine {
                 }
                 do {
                     try await self.runPrepare(continuation: continuation)
+                    print(">>> downloaded to: \(locator.downloadedLocation()!.path)")
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

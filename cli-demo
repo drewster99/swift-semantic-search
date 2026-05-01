@@ -1,0 +1,37 @@
+#!/bin/bash
+# Launcher for the Xcode-built cli-demo executable.
+#
+# Finds the most recently built cli-demo binary under the SemanticSearchDemo
+# DerivedData folder (Debug or Release, whichever is newer) and execs it with
+# whatever arguments were passed on the command line.
+#
+# Build it from Xcode (or via xcode-mcp-server) at least once before running
+# this script.
+
+set -euo pipefail
+
+DERIVED_BASE="${HOME}/Library/Developer/Xcode/DerivedData"
+
+candidates=()
+while IFS= read -r -d '' path; do
+    candidates+=("$path")
+done < <(find "$DERIVED_BASE" -maxdepth 5 -type f -path "*SemanticSearchDemo-*/Build/Products/*/cli-demo" -perm +111 -print0 2>/dev/null)
+
+if [ "${#candidates[@]}" -eq 0 ]; then
+    echo "cli-demo: no built binary found under $DERIVED_BASE" >&2
+    echo "  Build the cli-demo scheme in Xcode first (Examples/SemanticSearchDemo.xcodeproj)." >&2
+    exit 1
+fi
+
+# Pick the newest by modification time.
+newest=""
+newest_mtime=0
+for path in "${candidates[@]}"; do
+    mtime=$(stat -f %m "$path")
+    if [ "$mtime" -gt "$newest_mtime" ]; then
+        newest_mtime=$mtime
+        newest="$path"
+    fi
+done
+
+exec "$newest" "$@"
