@@ -1,7 +1,7 @@
 import Foundation
 
 /// Errors thrown by `SemanticSearchEngine` and supporting types.
-public enum SemanticSearchError: LocalizedError {
+enum SemanticSearchError: LocalizedError {
     /// `embed(...)` or `prepare()` was called before the model finished loading.
     case notReady
 
@@ -21,7 +21,7 @@ public enum SemanticSearchError: LocalizedError {
     /// A generic embedding failure with a message describing what went wrong.
     case embeddingFailed(String)
 
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
         case .notReady:
             return "SemanticSearchEngine is not ready. Call prepare() first."

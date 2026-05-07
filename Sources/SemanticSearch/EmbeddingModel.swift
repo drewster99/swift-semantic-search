@@ -43,7 +43,7 @@ public struct EmbeddingModel: Sendable, Hashable {
 
 extension EmbeddingModel {
     /// Qwen3 Embedding 0.6B, 4-bit DWQ quantization. Runs on Apple Silicon via MLX.
-    public static let qwen3Embedding_0_6B_4bitDWQ = EmbeddingModel(
+    static let qwen3Embedding_0_6B_4bitDWQ = EmbeddingModel(
         identifier: "qwen3-embedding-0.6b-4bit-dwq",
         displayName: "Qwen3 Embedding 0.6B (4-bit DWQ)",
         dimension: 1024,
