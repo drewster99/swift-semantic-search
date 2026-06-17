@@ -23,7 +23,7 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
     func embed(batch texts: [String]) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
 
-        return try await container.perform { model, tokenizer, pooler in
+        return try await container.perform { model, tokenizer, _ in
             var encoded: [[Int]] = []
             encoded.reserveCapacity(texts.count)
             for text in texts {
@@ -34,34 +34,31 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
                 encoded.append(tokens)
             }
 
-            // Qwen3 is autoregressive and has no [PAD] token — fall back to EOS,
-            // then to 0 as a last resort. The attention mask below excludes pad
-            // positions so they don't contribute to pooled outputs.
-            let padToken = tokenizer.convertTokenToId("[PAD]") ?? tokenizer.eosTokenId ?? 0
-
+            // Last-token (EOS) pooling for Qwen3, a CAUSAL model: the final real token has attended
+            // to the whole sequence, so its hidden state IS the sentence embedding. (MLXEmbedders
+            // mean-pools when a model ships no 1_Pooling/config.json — which Qwen3 doesn't — and that
+            // compresses the cosine distribution into a narrow high band.)
+            //
+            // Batching is preserved: a `.none` pooler returns the full per-token hidden states as a
+            // public MLXArray (Qwen3's `pooledOutput` is nil, so `.none` yields `hiddenStates`), and
+            // we gather each row's last REAL token ourselves. MLXEmbedders' `.last` strategy can't be
+            // used directly — it reads index -1, a PAD position under right-padding. Right-padding is
+            // safe for the forward pass anyway: Qwen3 is causal (it builds its own causal mask and
+            // ignores the passed attentionMask), so each EOS attends only to earlier real tokens and
+            // trailing pads never affect it.
+            let padToken = tokenizer.eosTokenId ?? 0
             let maxLength = encoded.map(\.count).max() ?? 0
-
             let padded = stacked(
                 encoded.map { tokens in
                     MLXArray(tokens + Array(repeating: padToken, count: maxLength - tokens.count))
                 }
             )
-            let mask = (padded .!= padToken)
-            let tokenTypes = MLXArray.zeros(like: padded)
-
-            let outputs = model(
-                padded,
-                positionIds: nil,
-                tokenTypeIds: tokenTypes,
-                attentionMask: mask
+            let outputs = model(padded, positionIds: nil, tokenTypeIds: nil, attentionMask: nil)
+            let hidden = Pooling(strategy: .none)(
+                outputs, mask: nil, normalize: false, applyLayerNorm: false
             )
-
-            let pooled = pooler(
-                outputs,
-                mask: mask,
-                normalize: true,
-                applyLayerNorm: false
-            )
+            let lastRows = encoded.indices.map { hidden[$0, encoded[$0].count - 1] }
+            let pooled = stacked(lastRows)
             pooled.eval()
 
             return try Self.extractVectors(from: pooled, expectedCount: encoded.count)
