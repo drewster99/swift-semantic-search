@@ -8,8 +8,11 @@ import Foundation
 /// host app can also ship a model inside its bundle (under `bundleSubdirectory`)
 /// to skip the first-launch download.
 public struct EmbeddingModel: Sendable, Hashable {
-    /// Stable, short identifier — used as a directory name and as the value tagged
-    /// onto stored vectors so callers can detect a model swap.
+    /// Stable identifier for the *embedding output* — encodes the model, its quantization, AND
+    /// the pooling scheme, so it changes whenever a produced vector would differ. NOT a cache key:
+    /// weights are located by `huggingFaceRepo` / `bundleSubdirectory`, so bumping this never
+    /// triggers a re-download. Persist it alongside stored vectors; a mismatch on load means those
+    /// vectors are stale and must be re-embedded.
     public let identifier: String
 
     /// Human-readable name for UI.
@@ -44,7 +47,7 @@ public struct EmbeddingModel: Sendable, Hashable {
 extension EmbeddingModel {
     /// Qwen3 Embedding 0.6B, 4-bit DWQ quantization. Runs on Apple Silicon via MLX.
     static let qwen3Embedding_0_6B_4bitDWQ = EmbeddingModel(
-        identifier: "qwen3-embedding-0.6b-4bit-dwq",
+        identifier: "qwen3-embedding-0.6b-4bit-dwq-lasttoken",
         displayName: "Qwen3 Embedding 0.6B (4-bit DWQ)",
         dimension: 1024,
         huggingFaceRepo: "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",

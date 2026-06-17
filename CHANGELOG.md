@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.0.2] - 2026-06-17
+
+### Changed
+- **`EmbeddingModel.identifier` now encodes the pooling scheme** (`…-lasttoken`). The identifier
+  is the stable signature of the *embedding output* (model + quantization + pooling), meant to be
+  persisted alongside stored vectors so a consumer can detect that a stored vector is stale and
+  re-embed it. It is **not** a cache key (weights are located by `huggingFaceRepo` /
+  `bundleSubdirectory`), so bumping it never forces a model re-download. Clarified the doc comment
+  accordingly (the old "used as a directory name" note was stale).
+  - This means 0.0.2's identifier differs from 0.0.1's even though both produce last-token vectors;
+    consumers that began persisting the identifier should treat the bump as a one-time re-embed.
+
 ## [0.0.1] - 2026-06-17
 
 First tagged release.
