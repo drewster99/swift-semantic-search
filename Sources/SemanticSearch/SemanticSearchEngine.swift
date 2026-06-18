@@ -169,6 +169,8 @@ public actor SemanticSearchEngine {
 
         continuation.yield(PrepareProgress(phase: .downloading, fractionCompleted: 0.05))
 
+        let modelWasCached: Bool = { if case .absent = location { return false }; return true }()
+        let loadStart = Date()
         let container = try await MLXEmbedders.loadModelContainer(
             hub: hub,
             configuration: configuration,
@@ -186,15 +188,22 @@ public actor SemanticSearchEngine {
             }
         )
 
+        print("[SemanticSearch] model \(modelWasCached ? "load (cached)" : "download + load") took "
+            + String(format: "%.1f", Date().timeIntervalSince(loadStart)) + "s")
+
         continuation.yield(PrepareProgress(phase: .warmingUp, fractionCompleted: 0.92))
 
         let backend = MLXEmbedderBackend(
             modelIdentifier: model.identifier,
             dimension: model.dimension,
-            container: container
+            container: container,
+            pooling: model.pooling
         )
 
+        let warmStart = Date()
         _ = try await backend.embed(batch: ["warmup"])
+        print("[SemanticSearch] warmup (first forward + Metal kernel compile) took "
+            + String(format: "%.1f", Date().timeIntervalSince(warmStart)) + "s")
 
         return backend
     }

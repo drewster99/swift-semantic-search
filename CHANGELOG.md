@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.0.3] - 2026-06-17
+
+### Changed
+- **Pooling is now a declared property of each model** — `EmbeddingModel.pooling: PoolingStrategy`
+  (`.lastToken` / `.mean` / `.cls`), a **required** init parameter. The backend switches on it and
+  **throws on a strategy it hasn't implemented** (during the warmup embed in `prepare()`) rather than
+  silently producing a wrong vector. Previously last-token was hardcoded — correct for Qwen3 but a
+  silent footgun for any non-causal model. Adding a new model now forces an explicit pooling decision
+  at compile time. Qwen3 declares `.lastToken`; **output is identical to 0.0.2** (the identifier is
+  unchanged, so no re-embedding is required).
+
+### Added
+- Load-phase timing: `prepare()` logs how long model download/load and warmup (first forward + Metal
+  kernel compilation) each take.
+
 ## [0.0.2] - 2026-06-17
 
 ### Changed
