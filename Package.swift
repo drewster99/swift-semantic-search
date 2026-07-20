@@ -16,13 +16,16 @@ let package = Package(
         // Pinned tightly: mlx-swift-lm has rewritten the MLXEmbedders public API on
         // its 3.x line (loadModelContainer now takes Downloader/TokenizerLoader
         // instead of HubApi). Stay on 2.x until we explicitly migrate.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "2.31.3"))
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "2.31.3")),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6"))
     ],
     targets: [
         .target(
             name: "SemanticSearch",
             dependencies: [
-                .product(name: "MLXEmbedders", package: "mlx-swift-lm")
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
+                .product(name: "MLXLinalg", package: "mlx-swift")
             ],
             path: "Sources/SemanticSearch"
         ),
