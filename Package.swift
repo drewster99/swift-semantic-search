@@ -14,9 +14,9 @@ let package = Package(
     ],
     dependencies: [
         // Pinned tightly: mlx-swift-lm has rewritten the MLXEmbedders public API on
-        // its main branch (loadModelContainer now takes Downloader/TokenizerLoader
-        // instead of HubApi). Stay on 2.29.x until we explicitly migrate.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "2.29.2"))
+        // its 3.x line (loadModelContainer now takes Downloader/TokenizerLoader
+        // instead of HubApi). Stay on 2.x until we explicitly migrate.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "2.31.3"))
     ],
     targets: [
         .target(
