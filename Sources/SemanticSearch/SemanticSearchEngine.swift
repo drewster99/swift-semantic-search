@@ -1,6 +1,12 @@
 import Foundation
 import Hub
 import MLXEmbedders
+import os
+
+/// Model load and warmup timings. A library has no business writing to the host application's
+/// stdout, and these are diagnostics the host may well want in a sysdiagnose, so they go to the
+/// unified log where a host can filter them by subsystem.
+nonisolated private let engineLogger = Logger(subsystem: "com.nuclearcyborg.SemanticSearch", category: "Engine")
 
 /// Tunable knobs for `SemanticSearchEngine`.
 public struct EngineOptions: Sendable {
@@ -96,7 +102,6 @@ public actor SemanticSearchEngine {
                 }
                 do {
                     try await self.runPrepare(continuation: continuation)
-                    print(">>> downloaded to: \(locator.downloadedLocation()!.path)")
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -188,8 +193,9 @@ public actor SemanticSearchEngine {
             }
         )
 
-        print("[SemanticSearch] model \(modelWasCached ? "load (cached)" : "download + load") took "
-            + String(format: "%.1f", Date().timeIntervalSince(loadStart)) + "s")
+        let loadSeconds = String(format: "%.1f", Date().timeIntervalSince(loadStart))
+        engineLogger.notice(
+            "model \(modelWasCached ? "load (cached)" : "download + load", privacy: .public) took \(loadSeconds, privacy: .public)s")
 
         continuation.yield(PrepareProgress(phase: .warmingUp, fractionCompleted: 0.92))
 
@@ -202,8 +208,9 @@ public actor SemanticSearchEngine {
 
         let warmStart = Date()
         _ = try await backend.embed(batch: ["warmup"])
-        print("[SemanticSearch] warmup (first forward + Metal kernel compile) took "
-            + String(format: "%.1f", Date().timeIntervalSince(warmStart)) + "s")
+        let warmSeconds = String(format: "%.1f", Date().timeIntervalSince(warmStart))
+        engineLogger.notice(
+            "warmup (first forward + Metal kernel compile) took \(warmSeconds, privacy: .public)s")
 
         return backend
     }

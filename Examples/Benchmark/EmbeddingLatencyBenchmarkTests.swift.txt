@@ -1,0 +1,213 @@
+import Foundation
+import Testing
+
+@testable import SemanticSearch
+
+/// Latency characterization for the MLX embedding path.
+///
+/// Motivation: a host application's logs showed `embed` taking 933–1280 ms for query texts of
+/// roughly 570–1500 tokens on an already-loaded, already-warmed model. A least-squares fit over
+/// those samples implied about 745 ms of FIXED cost plus ~0.36 ms/token of marginal cost — meaning
+/// most of the wall clock was not proportional to the work being done. Every one of those samples
+/// was an isolated call taken 20–52 minutes after the previous one, so "fixed per call" could not
+/// be distinguished from "first call after a long idle."
+///
+/// This suite separates the two by running each input REPEATEDLY, back to back, and reporting the
+/// first call apart from the steady-state ones:
+///
+/// - If rep 1 is slow and reps 2...n collapse, the cost is a wake/residency effect, and the fix is
+///   MLX cache configuration plus a keep-warm ping.
+/// - If every rep costs the same, the constant is genuinely per-call, and the next step is to
+///   instrument inside `MLXEmbedderBackend.embed` (tokenize / forward / eval / extract).
+///
+/// ## Corpus
+///
+/// Measuring on synthetic filler would understate token counts — a repeated word compresses under
+/// byte-pair encoding in a way real writing does not — so this reads REAL text supplied by the
+/// operator, via a JSON file whose path comes from the `SEMANTIC_SEARCH_BENCH_CORPUS` environment
+/// variable. The corpus is deliberately NOT committed: this is a public repository, and the
+/// realistic inputs for this measurement are a host application's private user messages and task
+/// descriptions. The test skips cleanly when the variable is unset.
+///
+///     {"samples": [{"label": "...", "kind": "...", "words": 42, "text": "..."}]}
+///
+/// Run it explicitly — it measures rather than asserts, and prints tables to stdout:
+///
+///     SEMANTIC_SEARCH_BENCH_CORPUS=/path/to/corpus.json swift test --filter Benchmark
+@Suite("Benchmark", .serialized)
+struct EmbeddingLatencyBenchmarkTests {
+
+    // MARK: - Corpus
+
+    /// One measured input: real text of a known length, with a label for the report.
+    private struct Sample: Decodable, Sendable {
+        let label: String
+        let kind: String
+        let words: Int
+        let text: String
+    }
+
+    private struct BenchmarkCorpus: Decodable, Sendable {
+        let samples: [Sample]
+    }
+
+    /// Loads the operator-supplied corpus, or nil when `SEMANTIC_SEARCH_BENCH_CORPUS` is unset.
+    /// A path that IS set but unreadable throws — a silent skip there would look like a pass.
+    private static func loadCorpus() throws -> BenchmarkCorpus? {
+        guard let path = ProcessInfo.processInfo.environment["SEMANTIC_SEARCH_BENCH_CORPUS"] else {
+            return nil
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        return try JSONDecoder().decode(BenchmarkCorpus.self, from: data)
+    }
+
+    /// Back-to-back repetitions per sample. The first is reported separately from the rest.
+    private static let repetitions = 8
+
+    // MARK: - Shared engine
+
+    /// One prepared engine for the whole suite. `prepare()` downloads (first run only), loads the
+    /// weights, and runs the package's built-in warmup, so every measurement below is taken
+    /// against a model that is already loaded and already warm.
+    private static let engine: Task<SemanticSearchEngine, Error> = Task {
+        let engine = SemanticSearchEngine()
+        for try await _ in engine.prepare() { /* drain progress */ }
+        return engine
+    }
+
+    // MARK: - Helpers
+
+    /// Wall-clock milliseconds for `body`, measured on the monotonic clock.
+    private static func milliseconds(_ body: () async throws -> Void) async rethrows -> Double {
+        let elapsed = try await ContinuousClock().measure { try await body() }
+        let components = elapsed.components
+        return Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        return sorted.count.isMultiple(of: 2)
+            ? (sorted[middle - 1] + sorted[middle]) / 2
+            : sorted[middle]
+    }
+
+    private static func pad(_ value: Double, _ width: Int = 8) -> String {
+        String(format: "%\(width).1f", value)
+    }
+
+    // MARK: - Tests
+
+    /// Primary experiment: latency against input size, each sample run `repetitions` times back to
+    /// back with no idle between calls.
+    @Test("embed latency vs input size, repeated back-to-back")
+    func latencyBySize() async throws {
+        guard let corpus = try Self.loadCorpus() else {
+            print("SEMANTIC_SEARCH_BENCH_CORPUS unset — skipping latency benchmark")
+            return
+        }
+        let engine = try await Self.engine.value
+
+        print("")
+        print("=== embed(single string) — \(Self.repetitions) back-to-back reps per sample ===")
+        print("  sample              words   chars |    rep1 |     min   median      max  (reps 2+) | rep1/steady")
+        print("  ------------------ ------  ------ | ------- | -------  -------  ------- | -----------")
+
+        for sample in corpus.samples {
+            var timings: [Double] = []
+            for _ in 0 ..< Self.repetitions {
+                timings.append(try await Self.milliseconds { _ = try await engine.embed(sample.text) })
+            }
+
+            let first = timings[0]
+            let rest = Array(timings.dropFirst())
+            let steady = Self.median(rest)
+
+            print(
+                "  \(sample.label.padding(toLength: 18, withPad: " ", startingAt: 0)) "
+                + "\(String(format: "%6d", sample.words))  \(String(format: "%6d", sample.text.count)) "
+                + "| \(Self.pad(first, 7)) "
+                + "| \(Self.pad(rest.min() ?? 0, 7))  \(Self.pad(steady, 7))  \(Self.pad(rest.max() ?? 0, 7)) "
+                + "| \(String(format: "%.2fx", steady > 0 ? first / steady : 0))"
+            )
+        }
+        print("")
+    }
+
+    /// The shape `MemoryStore.searchAll` actually issues: ONE forward pass carrying two
+    /// instruction-prefixed variants of the same query. Compared against the single-string cost at
+    /// the same size, this shows how much of a two-pool search is the second variant and how much
+    /// is per-call overhead that batching already amortizes.
+    @Test("batch of two vs batch of one at the same size")
+    func batchOfTwoVersusOne() async throws {
+        guard let corpus = try Self.loadCorpus() else {
+            print("SEMANTIC_SEARCH_BENCH_CORPUS unset — skipping batch benchmark")
+            return
+        }
+        let engine = try await Self.engine.value
+
+        // The real prefixes the host application uses, so padding characteristics match.
+        let memoryInstruction = "Return related memories"
+        let taskInstruction = "Given a software engineering task, retrieve earlier tasks that are "
+            + "related, similar, or could inform how to carry it out."
+
+        print("")
+        print("=== batch=1 vs batch=2 (two-pool search shape), median of \(Self.repetitions) reps ===")
+        print("  sample              words | batch=1  batch=2 |   delta   ratio")
+        print("  ------------------ ------ | -------  ------- | -------  -----")
+
+        for sample in corpus.samples {
+            let pair = ["\(memoryInstruction)\n\(sample.text)", "\(taskInstruction)\n\(sample.text)"]
+
+            var single: [Double] = []
+            var double: [Double] = []
+            for _ in 0 ..< Self.repetitions {
+                single.append(try await Self.milliseconds { _ = try await engine.embed(sample.text) })
+                double.append(try await Self.milliseconds { _ = try await engine.embed(batch: pair) })
+            }
+
+            let one = Self.median(single)
+            let two = Self.median(double)
+            print(
+                "  \(sample.label.padding(toLength: 18, withPad: " ", startingAt: 0)) "
+                + "\(String(format: "%6d", sample.words)) "
+                + "| \(Self.pad(one, 7))  \(Self.pad(two, 7)) "
+                + "| \(Self.pad(two - one, 7))  \(String(format: "%.2fx", two / max(one, 0.001)))"
+            )
+        }
+        print("")
+    }
+
+    /// Directly probes the residency hypothesis: measure, go idle, measure again. The production
+    /// gaps were 20–52 minutes; this uses a much shorter gap, so a null result here BOUNDS the
+    /// effect rather than disproving it.
+    @Test("latency after an idle gap")
+    func latencyAfterIdle() async throws {
+        guard let corpus = try Self.loadCorpus(),
+              let sample = corpus.samples.max(by: { $0.words < $1.words })
+        else {
+            print("SEMANTIC_SEARCH_BENCH_CORPUS unset — skipping idle probe")
+            return
+        }
+        let engine = try await Self.engine.value
+        let idleSeconds = 120
+
+        var warm: [Double] = []
+        for _ in 0 ..< 5 {
+            warm.append(try await Self.milliseconds { _ = try await engine.embed(sample.text) })
+        }
+
+        try await Task.sleep(for: .seconds(idleSeconds))
+
+        let afterIdle = try await Self.milliseconds { _ = try await engine.embed(sample.text) }
+        let recovered = try await Self.milliseconds { _ = try await engine.embed(sample.text) }
+
+        print("")
+        print("=== idle probe (\(sample.label), \(sample.words) words, \(idleSeconds)s gap) ===")
+        print("  steady-state median : \(Self.pad(Self.median(warm))) ms")
+        print("  first after idle    : \(Self.pad(afterIdle)) ms")
+        print("  immediately after   : \(Self.pad(recovered)) ms")
+        print("")
+    }
+}

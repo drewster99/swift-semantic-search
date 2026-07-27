@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.0.7] - 2026-07-26
+
+### Fixed
+- **Embeddings are now actually unit-length.** `extractVectors` widens to `Float32` *before* pooling
+  and L2 normalization. The model computes in bfloat16 — 7 mantissa bits, ~0.4% relative precision —
+  so dividing by the norm in that dtype rounded every component of the quotient, leaving vectors
+  whose lengths scattered across ±0.4% instead of sitting at 1.0 (measured 0.995752–1.004187 over a
+  223-vector corpus). That broke the contract this function exists to uphold, and broke it
+  *systematically* rather than randomly: a caller using a dot product as a stand-in for cosine — the
+  standard reason to normalize at all — gave a permanent ~0.4% boost to whichever vectors happened to
+  land above 1.0, on every query, forever.
+- **`prepare()` no longer force-unwraps.** A leftover debug `print` unwrapped
+  `ModelLocator.downloadedLocation()`, which is `nil` whenever the model is **bundled** — `locate()`
+  checks the bundle first, so nothing is ever downloaded. Shipping weights inside the host app (a
+  documented, supported configuration via `bundleSubdirectory`) therefore trapped on every successful
+  `prepare()`. A force unwrap traps rather than throws, so the enclosing `do`/`catch` never saw it.
+
+### Changed
+- Model load and warmup timings go to the unified log (subsystem `com.nuclearcyborg.SemanticSearch`,
+  category `Engine`) instead of `print()`. A library should not write to its host's stdout.
+
+### Notes
+- **`EmbeddingModel.identifier` is deliberately unchanged; re-embedding is NOT required.** Vectors
+  differ from 0.0.6 only in magnitude precision — direction is unchanged, because the components were
+  already bfloat16 coming out of the model and only the division moved to Float32. Bumping the
+  identifier would force every consumer to re-embed an entire corpus to correct a 0.4% magnitude
+  error. Callers using a true cosine are unaffected either way; callers relying on the unit-length
+  shortcut can rescale stored vectors on load, which is direction-preserving and recovers exactly the
+  intended vector.
+
+### Added
+- `Examples/Benchmark/` — an embedding latency harness. Deliberately **not** a SwiftPM target, matching
+  `Examples/CLIDemo` and `Examples/GUIDemo`: a published library should not carry a benchmark's
+  dependencies. Measures latency against input size, batch-of-1 vs batch-of-2, sequential vs batched
+  vs length-sorted corpus embedding, the MLX `cacheLimit`/`memoryLimit`/`wiredLimit` knobs, and an
+  idle probe. See its README for how to run it.
+
 ## [0.0.3] - 2026-06-17
 
 ### Changed

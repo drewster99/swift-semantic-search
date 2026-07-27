@@ -87,13 +87,22 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
     /// Models that ship without a `1_Pooling/config.json` (such as the default
     /// Qwen3 embedding repo) fall through to that 3D path.
     private static func extractVectors(from array: MLXArray, expectedCount: Int) throws -> [[Float]] {
-        let shape = array.shape
+        // Widen to Float32 BEFORE pooling and normalizing. The model computes in bfloat16, which
+        // keeps Float32's exponent range but has only 7 mantissa bits — roughly 0.4% relative
+        // precision. Dividing by the norm in that dtype rounds every component of the quotient, so
+        // the vectors come out with lengths scattered across ~±0.4% instead of 1.0. That breaks the
+        // unit-length contract this function exists to uphold, and it breaks it SYSTEMATICALLY: a
+        // caller using a dot product as a stand-in for cosine (the standard reason to normalize)
+        // gives a permanent ~0.4% boost to whichever vectors happen to land above 1.0, on every
+        // query, forever. Widening first costs one extra kernel over a (batch x dimension) array.
+        let widened = array.asType(.float32)
+        let shape = widened.shape
         let pooled: MLXArray
         switch shape.count {
         case 2:
-            pooled = array
+            pooled = widened
         case 3:
-            pooled = mean(array, axis: 1)
+            pooled = mean(widened, axis: 1)
         default:
             throw SemanticSearchError.unsupportedPoolingShape(shape)
         }
