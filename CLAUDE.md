@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `SemanticSearch` is a standalone Swift **package** (not an app) that wraps an MLX-backed embedding model behind a small public API. It targets macOS 14 / iOS 17 / visionOS 1 on Apple Silicon. There is no `.xcodeproj` — consumers add it as a SwiftPM dependency.
 
-The parent `/Users/andrew/cursor/CLAUDE.md` instructs using `xcode-mcp-server` for Xcode projects. That does not apply here: this is SwiftPM. Use `swift build` / `swift test` from the command line, or `xcodebuild` when MLX's Metal shaders need to be compiled (see Testing).
+The parent `/Users/andrew/cursor/CLAUDE.md` instructs using `drews-xcode-mcp` for Xcode projects. That does not apply here: this is SwiftPM. Use `swift build` / `swift test` from the command line, or `xcodebuild` when MLX's Metal shaders need to be compiled (see Testing).
 
 ## Commands
 

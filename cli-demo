@@ -5,7 +5,7 @@
 # DerivedData folder (Debug or Release, whichever is newer) and execs it with
 # whatever arguments were passed on the command line.
 #
-# Build it from Xcode (or via xcode-mcp-server) at least once before running
+# Build it from Xcode (or via drews-xcode-mcp) at least once before running
 # this script.
 
 set -euo pipefail
