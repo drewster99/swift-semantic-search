@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.0.8] - 2026-08-06
+
+### Added
+- **GPU memory introspection: `GPUMemoryReport`.** MLX allocates its tensors as Metal buffers,
+  which the OS accounts as `IOAccelerator` memory — invisible to malloc-based tooling while the
+  process footprint climbs into the tens of gigabytes. `GPUMemoryReport.current()` (also
+  `SemanticSearchEngine.gpuMemoryReport()`) reports MLX's active / cache / peak bytes plus the
+  Metal device's total allocation for the process, so hosts can see the gap between "what MLX is
+  using" and "what MLX is hoarding". The number that grows without bound on embedding workloads is
+  the **cache**: MLX recycles buffers by size, variable-length padding gives nearly every forward
+  pass unique sizes, and the default cache cap (≈1.5× the GPU working-set size) permits tens of GB.
+- **Per-batch growth tracing.** `MLXEmbedderBackend` logs a debug-level report after every forward
+  pass and a notice-level line each time MLX's footprint grows another 512 MB (unified log,
+  subsystem `com.nuclearcyborg.SemanticSearch`, category `GPUMemory`) — a runaway cache shows up
+  as a ladder of notices instead of a mystery footprint.
+- **Host policy knobs: `SemanticSearchEngine.setGPUCacheLimit(bytes:)` / `clearGPUCache()`.**
+  Thin static wrappers over `MLX.Memory` so a host can cap the cache or return it to Metal after a
+  bulk operation without importing MLX itself. The library deliberately sets no policy of its own —
+  the right cap depends on what else the process does.
+
 ## [0.0.7] - 2026-07-26
 
 ### Fixed

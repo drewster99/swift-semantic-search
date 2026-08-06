@@ -3,6 +3,12 @@ import MLX
 import MLXEmbedders
 import MLXLinalg
 import Tokenizers
+import os
+
+/// GPU-memory growth trace for the embedding path. Same subsystem as the engine logger so a host
+/// can pull both with one unified-log filter.
+nonisolated private let gpuMemoryLogger = Logger(
+    subsystem: "com.nuclearcyborg.SemanticSearch", category: "GPUMemory")
 
 /// MLX-backed embedding backend. Wraps a loaded `MLXEmbedders.ModelContainer`
 /// and runs one tokenize → pad → forward → pool → extract pipeline per call.
@@ -15,6 +21,15 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
     private let container: ModelContainer
     private let pooling: PoolingStrategy
 
+    /// MLX footprint (active + cache) at the last notice-level log, so growth is reported in
+    /// steps instead of once per batch. A lock rather than a plain var because `embed` is
+    /// nonisolated — serialization through the owning actor is a caller convention this file
+    /// shouldn't bet its memory safety on.
+    private let lastNoticedMLXFootprintBytes = OSAllocatedUnfairLock(initialState: 0)
+    /// Log at notice level every time MLX's footprint has grown this much since the last notice.
+    /// Debug-level lines fire on every batch regardless.
+    private static let footprintNoticeStepBytes = 512 * 1024 * 1024
+
     init(modelIdentifier: String, dimension: Int, container: ModelContainer, pooling: PoolingStrategy) {
         self.modelIdentifier = modelIdentifier
         self.dimension = dimension
@@ -24,6 +39,7 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
 
     func embed(batch texts: [String]) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
+        defer { logMemoryAfterBatch(batchSize: texts.count) }
         let pooling = self.pooling
 
         return try await container.perform { model, tokenizer, _ in
@@ -72,6 +88,27 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
             pooled.eval()
 
             return try Self.extractVectors(from: pooled, expectedCount: encoded.count)
+        }
+    }
+
+    /// Traces GPU memory after a forward pass: a debug line per batch, and a notice line each
+    /// time MLX's footprint has grown `footprintNoticeStepBytes` past the last notice — so a
+    /// runaway cache shows up as a ladder of notices in the unified log (subsystem
+    /// `com.nuclearcyborg.SemanticSearch`, category `GPUMemory`) rather than one line per batch
+    /// drowning everything else out.
+    private func logMemoryAfterBatch(batchSize: Int) {
+        let report = GPUMemoryReport.current()
+        gpuMemoryLogger.debug(
+            "after batch of \(batchSize, privacy: .public): \(report.description, privacy: .public)")
+        let shouldNotice = lastNoticedMLXFootprintBytes.withLock { lastNoticed in
+            guard report.mlxFootprintBytes - lastNoticed >= Self.footprintNoticeStepBytes else {
+                return false
+            }
+            lastNoticed = report.mlxFootprintBytes
+            return true
+        }
+        if shouldNotice {
+            gpuMemoryLogger.notice("MLX footprint grew: \(report.description, privacy: .public)")
         }
     }
 
