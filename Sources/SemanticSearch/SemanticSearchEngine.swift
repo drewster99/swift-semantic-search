@@ -1,22 +1,14 @@
 import Foundation
-import Hub
-import MLXEmbedders
-import os
-
-/// Model load and warmup timings. A library has no business writing to the host application's
-/// stdout, and these are diagnostics the host may well want in a sysdiagnose, so they go to the
-/// unified log where a host can filter them by subsystem.
-nonisolated private let engineLogger = Logger(subsystem: "com.nuclearcyborg.SemanticSearch", category: "Engine")
 
 /// Tunable knobs for `SemanticSearchEngine`.
 public struct EngineOptions: Sendable {
-    /// Maximum number of strings to feed into a single MLX forward pass when
-    /// `embed(batch:)` is called with more inputs than this. Defaults to 16,
-    /// which mirrors the value used by the `embedder-tool` reference
-    /// implementation but slightly higher to take advantage of M-series throughput.
-    /// Larger batches are faster per-call but use more memory during the forward pass.
+    /// Maximum number of strings fed into a single MLX forward pass when `embed(batch:)` is
+    /// called with more inputs than this. Larger batches are faster per string but use more
+    /// memory during the forward pass, because every string in a batch is padded to the
+    /// longest one. Values below 1 are treated as 1.
     public var maxBatchSize: Int
 
+    /// Creates options. `maxBatchSize` defaults to 16.
     public init(maxBatchSize: Int = 16) {
         self.maxBatchSize = maxBatchSize
     }
@@ -33,6 +25,11 @@ public struct EngineOptions: Sendable {
 ///    concurrent calls serialize on the GPU automatically.
 /// 4. Optionally call `unload()` to release weights from memory, or
 ///    `deleteDownloadedWeights()` to remove them from disk.
+///
+/// The engine's own failures are thrown as `SemanticSearchError`. Also passed through
+/// unchanged: errors from the download / model-loading stack, Foundation file-system errors
+/// from creating the cache directory (`prepare()`) and removing it
+/// (`deleteDownloadedWeights()`), and `CancellationError`.
 public actor SemanticSearchEngine {
     /// The model this engine was created with. Constant for the engine's lifetime.
     public nonisolated let model: EmbeddingModel
@@ -41,25 +38,50 @@ public actor SemanticSearchEngine {
     public nonisolated let options: EngineOptions
 
     private let locator: ModelLocator
+    private let backendLoader: any EmbeddingBackendLoader
     private var internalState: InternalState = .idle
+
+    /// Incremented for every load started. A load may only publish its result while it is still
+    /// the current generation; `unload()` and later loads supersede it.
+    private var loadGeneration: UInt64 = 0
+
+    /// Load tasks that have started and not yet finished, including ones `unload()` cancelled.
+    /// Cancellation is cooperative, so a cancelled load can keep touching the cache directory
+    /// for a while; deleting weights under it is refused until it finishes.
+    private var unfinishedLoadCount = 0
+
+    /// `prepare()` callers currently waiting on a load another caller started. Lets tests
+    /// release a load only after a joiner is attached to it.
+    private(set) var joinedLoadWaiterCount = 0
 
     private enum InternalState {
         case idle
-        case loading(Task<MLXEmbedderBackend, Error>)
-        case loaded(MLXEmbedderBackend)
+        case loading(Task<any EmbeddingBackend, Error>, generation: UInt64)
+        case loaded(any EmbeddingBackend)
         case failed(Error)
     }
 
+    /// Creates an engine for `model`. Nothing is loaded until `prepare()` is called.
     public init(model: EmbeddingModel = .default, options: EngineOptions = EngineOptions()) {
-        self.model = model
-        self.options = options
-        self.locator = ModelLocator(model: model)
+        self.init(model: model, options: options, locator: ModelLocator(model: model), backendLoader: MLXEmbedderBackendLoader())
     }
 
-    /// On-disk location of the model files, if the engine can find them.
+    init(
+        model: EmbeddingModel,
+        options: EngineOptions,
+        locator: ModelLocator,
+        backendLoader: any EmbeddingBackendLoader
+    ) {
+        self.model = model
+        self.options = options
+        self.locator = locator
+        self.backendLoader = backendLoader
+    }
+
+    /// On-disk location of the model files, if the engine can find a complete copy.
     /// Returns the bundled URL if the model is shipped inside the host app,
-    /// the cache URL once the model has been downloaded, or `nil` if no copy
-    /// exists on disk yet. Cheap — does not load anything.
+    /// the cache URL once the model has been downloaded, or `nil` if no complete copy
+    /// exists on disk yet. Cheap — checks the file system, loads and creates nothing.
     public nonisolated func modelLocationOnDisk() -> URL? {
         switch locator.locate() {
         case .bundled(let url), .downloaded(let url):
@@ -69,14 +91,11 @@ public actor SemanticSearchEngine {
         }
     }
 
-    /// Current public state. Cheap — does not load anything.
+    /// Current public state. Cheap — checks the file system, loads and creates nothing.
     public var state: ModelState {
         switch internalState {
         case .idle:
-            switch locator.locate() {
-            case .bundled, .downloaded: return .availableOnDisk
-            case .absent: return .notDownloaded
-            }
+            return locator.locate().isOnDisk ? .availableOnDisk : .notDownloaded
         case .loading: return .loading
         case .loaded: return .ready
         case .failed(let error): return .failed(error)
@@ -93,13 +112,13 @@ public actor SemanticSearchEngine {
     /// `.done` event. Calling it during an in-flight load joins the existing
     /// load and emits a single completion event when it finishes (granular
     /// progress is only seen by the first caller).
+    ///
+    /// The engine is kept alive until the stream finishes. If `unload()` is called before the
+    /// load completes, the stream throws `CancellationError` and the engine stays unloaded.
+    /// Ending iteration early does not cancel the load; call `unload()` for that.
     public nonisolated func prepare() -> AsyncThrowingStream<PrepareProgress, Error> {
         AsyncThrowingStream { continuation in
-            let task = Task { [weak self] in
-                guard let self else {
-                    continuation.finish()
-                    return
-                }
+            let task = Task {
                 do {
                     try await self.runPrepare(continuation: continuation)
                     continuation.finish()
@@ -116,109 +135,93 @@ public actor SemanticSearchEngine {
     private func runPrepare(
         continuation: AsyncThrowingStream<PrepareProgress, Error>.Continuation
     ) async throws {
-        if case .loaded = internalState {
+        switch internalState {
+        case .loaded:
             continuation.yield(
-                PrepareProgress(phase: .done, fractionCompleted: 1.0, message: "Already loaded")
+                PrepareProgress(phase: .done, fractionCompleted: PrepareProgressFraction.done, message: "Already loaded")
             )
             return
-        }
 
-        if case .loading(let existingTask) = internalState {
+        case .loading(let existingTask, let generation):
             continuation.yield(
                 PrepareProgress(
                     phase: .loadingWeights,
-                    fractionCompleted: 0.5,
+                    fractionCompleted: PrepareProgressFraction.joinedInFlightLoad,
                     message: "Joining in-flight load"
                 )
             )
-            _ = try await existingTask.value
-            continuation.yield(PrepareProgress(phase: .done, fractionCompleted: 1.0))
+            joinedLoadWaiterCount += 1
+            let result = await existingTask.result
+            joinedLoadWaiterCount -= 1
+            try publish(result, generation: generation)
+            continuation.yield(PrepareProgress(phase: .done, fractionCompleted: PrepareProgressFraction.done))
             return
+
+        case .idle, .failed:
+            break
         }
 
-        let loadTask = Task<MLXEmbedderBackend, Error> { [weak self] in
-            guard let self else { throw CancellationError() }
-            return try await self.performLoad(continuation: continuation)
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        let model = self.model
+        let locator = self.locator
+        let backendLoader = self.backendLoader
+        let loadTask = Task<any EmbeddingBackend, Error> {
+            try await backendLoader.loadBackend(for: model, locator: locator, progress: continuation)
         }
-        internalState = .loading(loadTask)
+        internalState = .loading(loadTask, generation: generation)
+        unfinishedLoadCount += 1
 
-        do {
-            let backend = try await loadTask.value
-            internalState = .loaded(backend)
-            continuation.yield(PrepareProgress(phase: .done, fractionCompleted: 1.0))
-        } catch {
-            internalState = .failed(error)
+        let result = await loadTask.result
+        unfinishedLoadCount -= 1
+        try publish(result, generation: generation)
+        continuation.yield(PrepareProgress(phase: .done, fractionCompleted: PrepareProgressFraction.done))
+    }
+
+    /// Single point where a finished load's outcome reaches `internalState`, shared by the caller
+    /// that started the load and every caller that joined it. Whichever of them resumes first
+    /// publishes; the rest observe what was published. Actor reentrancy means `unload()` or a
+    /// newer `prepare()` may have run during their await, in which case the result is discarded.
+    ///
+    /// Returns normally when the load's generation ended up loaded; rethrows the load's error
+    /// when it ended up failed; throws `CancellationError` when it was superseded.
+    private func publish(_ result: Result<any EmbeddingBackend, Error>, generation: UInt64) throws {
+        if isCurrentLoad(generation) {
+            switch result {
+            case .success(let backend):
+                internalState = .loaded(backend)
+                return
+            case .failure(let error):
+                internalState = .failed(error)
+                throw error
+            }
+        }
+        guard generation == loadGeneration else {
+            throw CancellationError()
+        }
+        switch internalState {
+        case .loaded:
+            return
+        case .failed(let error):
             throw error
+        case .idle, .loading:
+            throw CancellationError()
         }
     }
 
-    private func performLoad(
-        continuation: AsyncThrowingStream<PrepareProgress, Error>.Continuation
-    ) async throws -> MLXEmbedderBackend {
-        continuation.yield(PrepareProgress(phase: .locating, fractionCompleted: 0.02))
-
-        let location = locator.locate()
-
-        let modelRepo = model.huggingFaceRepo
-        let configuration: MLXEmbedders.ModelConfiguration = await MainActor.run {
-            switch location {
-            case .bundled(let url):
-                return ModelConfiguration(directory: url)
-            case .downloaded, .absent:
-                return ModelConfiguration.configuration(id: modelRepo)
-            }
+    private func isCurrentLoad(_ generation: UInt64) -> Bool {
+        if case .loading(_, let current) = internalState {
+            return current == generation
         }
-
-        let cacheBase = try locator.cacheBaseURL()
-        let hub = HubApi(downloadBase: cacheBase)
-
-        continuation.yield(PrepareProgress(phase: .downloading, fractionCompleted: 0.05))
-
-        let modelWasCached: Bool = { if case .absent = location { return false }; return true }()
-        let loadStart = Date()
-        let container = try await MLXEmbedders.loadModelContainer(
-            hub: hub,
-            configuration: configuration,
-            progressHandler: { progress in
-                // Reserve 5% for locate, 85% for download/load, 10% for warmup.
-                let scaled = 0.05 + 0.85 * progress.fractionCompleted
-                continuation.yield(
-                    PrepareProgress(
-                        phase: .downloading,
-                        fractionCompleted: scaled,
-                        bytesDownloaded: progress.completedUnitCount,
-                        bytesTotal: progress.totalUnitCount > 0 ? progress.totalUnitCount : nil
-                    )
-                )
-            }
-        )
-
-        let loadSeconds = String(format: "%.1f", Date().timeIntervalSince(loadStart))
-        engineLogger.notice(
-            "model \(modelWasCached ? "load (cached)" : "download + load", privacy: .public) took \(loadSeconds, privacy: .public)s")
-
-        continuation.yield(PrepareProgress(phase: .warmingUp, fractionCompleted: 0.92))
-
-        let backend = MLXEmbedderBackend(
-            modelIdentifier: model.identifier,
-            dimension: model.dimension,
-            container: container,
-            pooling: model.pooling
-        )
-
-        let warmStart = Date()
-        _ = try await backend.embed(batch: ["warmup"])
-        let warmSeconds = String(format: "%.1f", Date().timeIntervalSince(warmStart))
-        engineLogger.notice(
-            "warmup (first forward + Metal kernel compile) took \(warmSeconds, privacy: .public)s")
-
-        return backend
+        return false
     }
 
     // MARK: - Embed
 
     /// Embeds a single string. Returns an L2-normalized `[Float]` of length
     /// `model.dimension`.
+    ///
+    /// Throws `SemanticSearchError.notReady` unless `prepare()` has completed.
     public func embed(_ text: String) async throws -> [Float] {
         let result = try await embed(batch: [text])
         guard let first = result.first else {
@@ -229,6 +232,10 @@ public actor SemanticSearchEngine {
 
     /// Embeds a batch of strings. Internally chunks at `options.maxBatchSize`,
     /// running one MLX forward pass per chunk. Returned vectors are in input order.
+    ///
+    /// Throws `SemanticSearchError.notReady` unless `prepare()` has completed. Cancellation is
+    /// checked between chunks, so cancelling the calling task stops a large batch early with
+    /// `CancellationError` (the chunk already running on the GPU finishes first).
     public func embed(batch texts: [String]) async throws -> [[Float]] {
         let backend = try requireLoadedBackend()
         guard !texts.isEmpty else { return [] }
@@ -243,6 +250,7 @@ public actor SemanticSearchEngine {
         var index = 0
         while index < texts.count {
             let end = min(index + chunkSize, texts.count)
+            try Task.checkCancellation()
             let chunk = Array(texts[index..<end])
             let chunkResults = try await backend.embed(batch: chunk)
             results.append(contentsOf: chunkResults)
@@ -254,6 +262,13 @@ public actor SemanticSearchEngine {
     /// Convenience: embed `query` and rank it against caller-owned document
     /// vectors via `VectorMath.match`. The package never owns your corpus —
     /// `documents` is whatever you pass in.
+    ///
+    /// - Parameters:
+    ///   - query: The text to search for.
+    ///   - documents: Caller-owned document vectors, normally produced by `embed(batch:)`.
+    ///   - top: Maximum number of results; `nil` returns every scored document. Must not be negative.
+    /// - Returns: `(index, score)` pairs sorted by cosine similarity, highest first. See
+    ///   `VectorMath.match` for which documents are skipped.
     public func match(
         query: String,
         against documents: [[Float]],
@@ -266,10 +281,11 @@ public actor SemanticSearchEngine {
     // MARK: - Unload / Delete
 
     /// Releases the loaded model from memory. If a `prepare()` call is currently
-    /// in flight, it is cancelled. After this call, `state` returns
-    /// `.availableOnDisk` (or `.notDownloaded` if the cache was wiped externally).
+    /// in flight, it is cancelled and its stream throws `CancellationError`; its result is
+    /// discarded even if the underlying load finishes anyway. After this call, `state` returns
+    /// `.availableOnDisk` (or `.notDownloaded` if no complete copy is on disk).
     public func unload() {
-        if case .loading(let task) = internalState {
+        if case .loading(let task, _) = internalState {
             task.cancel()
         }
         internalState = .idle
@@ -278,19 +294,23 @@ public actor SemanticSearchEngine {
     /// Removes the downloaded model files from the cache directory. Bundled
     /// model files (shipped inside the host app's bundle) are never touched.
     /// Throws `SemanticSearchError.cannotDeleteWhileLoaded` if the model is
-    /// currently loaded or loading — call `unload()` first.
+    /// currently loaded or loading — call `unload()` first — or if a load cancelled by
+    /// `unload()` has not finished winding down yet; retry once it has.
     public func deleteDownloadedWeights() throws {
         switch internalState {
         case .loaded, .loading:
             throw SemanticSearchError.cannotDeleteWhileLoaded
         case .idle, .failed:
+            guard unfinishedLoadCount == 0 else {
+                throw SemanticSearchError.cannotDeleteWhileLoaded
+            }
             try locator.deleteDownloaded()
         }
     }
 
     // MARK: - Internals
 
-    private func requireLoadedBackend() throws -> MLXEmbedderBackend {
+    private func requireLoadedBackend() throws -> any EmbeddingBackend {
         if case .loaded(let backend) = internalState {
             return backend
         }

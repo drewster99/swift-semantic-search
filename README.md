@@ -5,21 +5,27 @@ A small Swift package for on-device semantic search on Apple platforms. Wraps an
 > **Heads-up:** in its current state, this package is built for **short, focused inputs** — sentences, short paragraphs, FAQ-style entries, or anything else that fits comfortably in a single embedding. There is no built-in document chunking, so feeding it long-form prose (multi-page documents, full chapters, anything tens of thousands of tokens) will produce one diluted "average" vector for the whole thing and silently lose anything past the model's context limit. See [Limitations and future improvements](#limitations-and-future-improvements) below.
 
 ## Why Build This?
-Apple's models didn't work well for a semantic search purposes.
+Apple's on-device models didn't work well for semantic search.
 
 ## Features
 
 - One-call `prepare()` that downloads (if needed), loads, and warms up an embedding model. Reports progress as an `AsyncThrowingStream`.
-- Embed single strings or batches with one method.
-- Pure ranking helper: `match(query:against:top:)` ranks a query vector against a caller-owned set of document vectors. The package never owns your corpus.
-- Bundled-or-downloaded model resolution: detects a model shipped inside the host app's bundle, or falls back to a cache directory it manages itself.
+- Embed single strings or batches with one method. Output vectors are L2-normalized (unit length).
+- Pure ranking helper: `VectorMath.match(query:against:top:)` ranks a query vector against a caller-owned set of document vectors, and `SemanticSearchEngine.match(query:against:top:)` embeds the query first. The package never owns your corpus.
+- Bundled-or-downloaded model resolution: detects a model shipped inside the host app's bundle, or falls back to a cache directory it manages itself. Weights already on disk load without the network.
 - Explicit `unload()` to release weights from memory and `deleteDownloadedWeights()` to remove them from disk.
-- Default model: `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`. Adding more models is one static on `EmbeddingModel`.
+- GPU memory introspection (`SemanticSearchEngine.gpuMemoryReport()`) and host-controlled MLX cache knobs (`setGPUCacheLimit(bytes:)`, `clearGPUCache()`).
+- Default model: `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ` (1024 dimensions, last-token pooling). Custom models can be described with `EmbeddingModel(...)`; the backend currently implements `.lastToken` pooling only.
 
 ## Requirements
 
-- macOS 14, iOS 17, visionOS 1 or newer
+- macOS 14, iOS 17, visionOS 1 or newer. Apple platforms only: the package uses Accelerate, Metal and MLX, and does not build on Linux.
 - Apple Silicon (the MLX backend requires Metal)
+- A Swift 6.3 or newer toolchain. `Package.swift` declares tools version 6.1, but the MLX dependency requires 6.3.
+
+### MLX dependency note
+
+This package depends on patched forks, `drewster99/mlx-swift` and `drewster99/mlx-swift-lm`, which carry a fix for a Metal API Validation assertion (see [ROADMAP.md](ROADMAP.md)). SwiftPM identifies packages by the last component of their URL, so an app that also depends on `ml-explore/mlx-swift` or `ml-explore/mlx-swift-lm` gets a "conflicting identity" warning and only one copy is used. Tracked in [#1](https://github.com/drewster99/swift-semantic-search/issues/1).
 
 ## Installation
 
@@ -64,20 +70,32 @@ await engine.unload()
 try await engine.deleteDownloadedWeights()
 ```
 
+Store `engine.model.identifier` alongside your document vectors. If it differs on a later launch, the stored vectors came from a different model or pooling scheme and must be re-embedded.
+
+## Errors
+
+Engine methods throw `SemanticSearchError` for the package's own failures (`notReady` before `prepare()` completes, `cannotDeleteWhileLoaded`, `dimensionMismatch`, `nonFiniteEmbedding`, …). Errors from the download and model-loading stack are passed through unchanged. If `unload()` interrupts a `prepare()`, that `prepare()` stream throws `CancellationError`, as does an `embed(batch:)` whose task is cancelled between chunks.
+
+`VectorMath.match` does not throw: it skips documents whose length differs from the query, documents with zero magnitude, and documents whose score is not finite. `top` must not be negative.
+
+## Storage
+
+Downloaded weights live under `Application Support/<bundle identifier>/SemanticSearch/models/` (processes without a bundle identifier, such as command-line tools, share `Application Support/SemanticSearch/SemanticSearch/models/`). The directory is excluded from iCloud and device backups because the weights are re-downloadable. A model directory only counts as present when it holds `config.json`, `tokenizer.json`, `tokenizer_config.json` and at least one `.safetensors` file, so an interrupted download is reported as `.notDownloaded`.
+
 ## Running the tests
 
-The pure-logic `VectorMath` tests run anywhere:
+The unit suites (`VectorMath`, `VectorMathRanking`, `EngineLifecycle`, `ModelLocator`,
+`BackendLoading`) need neither the network nor a GPU:
 
 ```sh
-swift test --filter VectorMath
+swift test --filter 'VectorMath|EngineLifecycle|EngineJoin|ModelLocator|BackendLoading'
 ```
 
 The end-to-end `Integration` suite loads the real MLX model and exercises
-`prepare()` + `embed()` + `match()` against a curated corpus. It must be run
-through Xcode's build pipeline — `swift test` on its own cannot compile MLX's
-Metal shaders, so the metallib isn't present at runtime.
-
-Note: These tests will take several minutes:
+`prepare()` + `embed()` + `match()` against a curated corpus. It needs Apple Silicon,
+and the network on first run. With a recent toolchain (verified with Swift 6.4 / Xcode 27.1)
+plain `swift test` runs it. With older toolchains SwiftPM may not produce MLX's metallib; run
+it through Xcode's build pipeline instead:
 
 ```sh
 xcodebuild test \
@@ -86,7 +104,7 @@ xcodebuild test \
     -only-testing:SemanticSearchTests/SemanticSearchIntegrationTests
 ```
 
-The first run downloads the default Qwen3 embedding weights (~330 MB) into the
+The first run downloads the default Qwen3 embedding weights (about 320 MB) into the
 test host's Application Support cache; subsequent runs reuse the cache and
 finish in a few seconds.
 
@@ -118,7 +136,8 @@ How this would land in the package: a `Chunker` utility (token-aware split with 
 ### Other rough edges
 
 - The two demo targets use different on-disk caches because `Bundle.main.bundleIdentifier` differs (CLI tools have no bundle id; the SwiftUI app does). First launch of each will re-download the weights into its own cache directory.
-- `cli-demo` and `gui-demo` are built with Xcode (the `Examples/SemanticSearchDemo.xcodeproj`), not via `swift run`. Plain `swift build`/`swift run` cannot compile MLX's Metal shaders, so the metallib is missing at runtime — this is a SwiftPM-CLI vs. Xcode gap, not something this package can fix on its own.
+- `cli-demo` and `gui-demo` are built with Xcode (the `Examples/SemanticSearchDemo.xcodeproj`), not via `swift run`; they are not SwiftPM targets.
+- Embedding runs synchronously on a Swift Concurrency thread for the duration of each forward pass, and inputs are not truncated to the model's context window.
 
 ## License
 

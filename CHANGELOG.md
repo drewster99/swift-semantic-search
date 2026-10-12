@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.1.0] - 2026-10-12
+
+### Fixed
+- **`unload()` during `prepare()` no longer corrupts engine state.** Each load carries a generation;
+  a load superseded by `unload()` or a newer `prepare()` can no longer publish its result. Before,
+  a load that finished after `unload()` re-marked the engine ready, and a superseded load that
+  failed overwrote a newer in-flight load with `.failed`. A `prepare()` interrupted this way now
+  throws `CancellationError`.
+  The caller that started a load and every caller that joined it publish through one helper, so all
+  of them finish with `.done` on success and throw `CancellationError` when the load was superseded.
+- **`deleteDownloadedWeights()` refuses while a cancelled load is still winding down**
+  (`cannotDeleteWhileLoaded`), instead of deleting files under it.
+- **Weights already on disk load without the network.** Downloaded weights now load from their
+  directory. Before, every `prepare()` re-listed the Hugging Face repository and failed on any
+  network error other than "not connected" (captive portal, DNS failure, timeout, server error).
+- **Interrupted downloads are no longer reported as present.** A model directory must hold
+  `config.json`, `tokenizer.json`, `tokenizer_config.json` and a `.safetensors` file.
+- **`prepare()` completes when the caller does not retain the engine.** It used to finish silently
+  with no `.done` and no error.
+- **Cancelling `embed(batch:)` stops between chunks** with `CancellationError`.
+- **Progress no longer reports file counts as bytes.** `bytesDownloaded` / `bytesTotal` are now
+  `nil` from `prepare()`: the download stack reports per-file progress only. Loads of weights
+  already on disk report `.loadingWeights` instead of `.downloading`.
+- **Produced vectors are validated**: wrong length throws `dimensionMismatch`, NaN/infinity throws
+  `nonFiniteEmbedding`.
+- **`VectorMath.match`** skips documents whose score is not finite (previously ranked as NaN),
+  orders equal scores by ascending index, and states that a negative `top` traps.
+
+### Changed
+- The model cache directory is excluded from iCloud / device backups.
+- `state` and `modelLocationOnDisk()` no longer create directories.
+- `SemanticSearchError` is now public, so callers can match on its cases. New cases:
+  `dimensionMismatch(expected:received:)`, `nonFiniteEmbedding`.
+- `swift-transformers` (`Hub`, `Tokenizers`) is declared as a direct dependency, with the same
+  version range `mlx-swift-lm` already requires.
+- Documentation: README (requirements, errors, storage, tests, install version), doc comments,
+  `.spi.yml` for Swift Package Index documentation.
+
 ## [0.0.8] - 2026-08-06
 
 ### Added

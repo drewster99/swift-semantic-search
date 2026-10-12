@@ -14,8 +14,10 @@ public struct GPUMemoryReport: Sendable, CustomStringConvertible {
     /// Bytes in MLX buffers currently backing live `MLXArray`s.
     public let mlxActiveBytes: Int
     /// Bytes MLX holds in its recycling cache: allocated Metal memory backing NO live array,
-    /// kept for reuse. Unbounded by default — this is the number that grows monotonically when
-    /// no `Memory.cacheLimit` is set, because every new buffer SHAPE is cached forever.
+    /// kept for reuse. MLX's default cap is about 1.5x the GPU's recommended working-set size,
+    /// which on large machines allows tens of gigabytes; this is the number that ratchets up
+    /// under an embedding workload, because variable-length padding gives nearly every forward
+    /// pass new buffer sizes.
     public let mlxCacheBytes: Int
     /// MLX's high-water mark (active + cache) since process start.
     public let mlxPeakBytes: Int
@@ -38,6 +40,7 @@ public struct GPUMemoryReport: Sendable, CustomStringConvertible {
         )
     }
 
+    /// One-line summary in GB (base 2), for logs.
     public var description: String {
         func gb(_ bytes: Int) -> String { String(format: "%.2f GB", Double(bytes) / 1_073_741_824) }
         return "MLX active \(gb(mlxActiveBytes)), cache \(gb(mlxCacheBytes)), "
@@ -55,10 +58,10 @@ extension SemanticSearchEngine {
     }
 
     /// Caps MLX's buffer-recycling cache. Above the cap, buffers released by dying `MLXArray`s
-    /// are returned to Metal instead of hoarded. The DEFAULT is unbounded, and an embedding
-    /// workload hits the worst case for it: every distinct padded batch shape allocates fresh
-    /// buffers, so the cache accumulates one working set per shape ever seen and the process
-    /// footprint only ratchets up. Pass 0 to disable caching entirely.
+    /// are returned to Metal instead of hoarded. The default cap (about 1.5x the GPU's
+    /// recommended working-set size) is generous, and an embedding workload hits the worst case
+    /// for it: every distinct padded batch shape allocates fresh buffers, so the cache keeps
+    /// growing toward the cap. Pass 0 to disable caching entirely.
     ///
     /// This is a process-global policy knob deliberately left to the HOST — the library never
     /// sets it on its own, because the right value depends on what else the process does.

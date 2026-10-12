@@ -5,11 +5,6 @@ import MLXLinalg
 import Tokenizers
 import os
 
-/// GPU-memory growth trace for the embedding path. Same subsystem as the engine logger so a host
-/// can pull both with one unified-log filter.
-nonisolated private let gpuMemoryLogger = Logger(
-    subsystem: "com.nuclearcyborg.SemanticSearch", category: "GPUMemory")
-
 /// MLX-backed embedding backend. Wraps a loaded `MLXEmbedders.ModelContainer`
 /// and runs one tokenize → pad → forward → pool → extract pipeline per call.
 ///
@@ -41,6 +36,7 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
         guard !texts.isEmpty else { return [] }
         defer { logMemoryAfterBatch(batchSize: texts.count) }
         let pooling = self.pooling
+        let expectedDimension = self.dimension
 
         return try await container.perform { model, tokenizer, _ in
             var encoded: [[Int]] = []
@@ -87,7 +83,9 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
             }
             pooled.eval()
 
-            return try Self.extractVectors(from: pooled, expectedCount: encoded.count)
+            let vectors = try Self.extractVectors(from: pooled, expectedCount: encoded.count)
+            try Self.validate(vectors, expectedDimension: expectedDimension)
+            return vectors
         }
     }
 
@@ -112,17 +110,26 @@ internal final class MLXEmbedderBackend: EmbeddingBackend {
         }
     }
 
+    /// Checks the API contract on every produced vector: length equals the model's declared
+    /// dimension and every component is finite. A wrong `dimension` on a custom model, or a
+    /// numerical blow-up in the forward pass, would otherwise reach callers as vectors that
+    /// `VectorMath.match` silently skips.
+    static func validate(_ vectors: [[Float]], expectedDimension: Int) throws {
+        for vector in vectors {
+            guard vector.count == expectedDimension else {
+                throw SemanticSearchError.dimensionMismatch(expected: expectedDimension, received: vector.count)
+            }
+            guard vector.allSatisfy(\.isFinite) else {
+                throw SemanticSearchError.nonFiniteEmbedding
+            }
+        }
+    }
+
     /// Extracts `[Float]` vectors from a pooled MLX tensor and L2-normalizes them
     /// at the sentence level so the API contract (unit-length sentence embeddings)
-    /// holds regardless of the pooling strategy. Handles both 2D `(batch, dim)`
-    /// outputs and 3D `(batch, seq, dim)` outputs — in the 3D case we mean-pool
-    /// across the sequence axis first.
-    ///
-    /// The separate L2 pass matters because the MLX pooler's `normalize: true`
-    /// flag is applied *before* our Swift-side mean pooling in the 3D case: each
-    /// token is unit-normalized, but averaging them does not preserve unit norm.
-    /// Models that ship without a `1_Pooling/config.json` (such as the default
-    /// Qwen3 embedding repo) fall through to that 3D path.
+    /// holds regardless of the pooling strategy. `.lastToken` pooling produces 2D
+    /// `(batch, dim)` output; the 3D `(batch, seq, dim)` branch mean-pools across the
+    /// sequence axis and exists for a future pooling path that returns per-token states.
     private static func extractVectors(from array: MLXArray, expectedCount: Int) throws -> [[Float]] {
         // Widen to Float32 BEFORE pooling and normalizing. The model computes in bfloat16, which
         // keeps Float32's exponent range but has only 7 mantissa bits — roughly 0.4% relative

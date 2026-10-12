@@ -23,12 +23,14 @@ public enum ModelState: Sendable {
 
 /// A single progress event emitted by `SemanticSearchEngine.prepare()`.
 public struct PrepareProgress: Sendable {
+    /// The stage of `prepare()` an event belongs to.
     public enum Phase: Sendable, Equatable {
         /// Checking the bundle and cache directory for an existing copy.
         case locating
         /// Downloading model weights from HuggingFace.
         case downloading
-        /// Loading weights from disk into the MLX runtime.
+        /// Loading weights already on disk (bundled or previously downloaded) into the MLX
+        /// runtime. Also reported to callers that joined an in-flight load.
         case loadingWeights
         /// Running a single warmup embedding so the first real call is hot.
         case warmingUp
@@ -36,22 +38,25 @@ public struct PrepareProgress: Sendable {
         case done
     }
 
+    /// The stage this event belongs to.
     public let phase: Phase
 
     /// Estimated completion across the entire `prepare()` call, in `[0.0, 1.0]`.
     public let fractionCompleted: Double
 
-    /// Bytes downloaded so far. `nil` outside the `.downloading` phase or when
-    /// the underlying download API hasn't reported it yet.
+    /// Bytes downloaded so far, when known. The current download stack reports progress per
+    /// file rather than per byte, so `SemanticSearchEngine.prepare()` leaves this `nil`; use
+    /// `fractionCompleted` for progress UI.
     public let bytesDownloaded: Int64?
 
-    /// Total bytes expected. `nil` outside the `.downloading` phase or when
-    /// the size hasn't been determined yet.
+    /// Total bytes expected, when known. `nil` from `SemanticSearchEngine.prepare()` for the
+    /// same reason as `bytesDownloaded`.
     public let bytesTotal: Int64?
 
     /// Optional human-readable hint for UI.
     public let message: String?
 
+    /// Creates a progress event.
     public init(
         phase: Phase,
         fractionCompleted: Double,

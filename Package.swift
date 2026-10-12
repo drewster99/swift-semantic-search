@@ -17,7 +17,10 @@ let package = Package(
         // its 3.x line (loadModelContainer now takes Downloader/TokenizerLoader
         // instead of HubApi). Stay on the patched 2.x fork until we explicitly migrate.
         .package(url: "https://github.com/drewster99/mlx-swift-lm", .upToNextMinor(from: "2.31.4")),
-        .package(url: "https://github.com/drewster99/mlx-swift", .upToNextMinor(from: "0.31.7"))
+        .package(url: "https://github.com/drewster99/mlx-swift", .upToNextMinor(from: "0.31.7")),
+        // Declared directly because the sources import `Hub` and `Tokenizers`. The range matches
+        // the one mlx-swift-lm declares, so it never narrows resolution.
+        .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.2.0"))
     ],
     targets: [
         .target(
@@ -25,13 +28,18 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
-                .product(name: "MLXLinalg", package: "mlx-swift")
+                .product(name: "MLXLinalg", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
+                .product(name: "Tokenizers", package: "swift-transformers")
             ],
             path: "Sources/SemanticSearch"
         ),
         .testTarget(
             name: "SemanticSearchTests",
-            dependencies: ["SemanticSearch"],
+            dependencies: [
+                "SemanticSearch",
+                .product(name: "MLXEmbedders", package: "mlx-swift-lm")
+            ],
             path: "Tests/SemanticSearchTests",
             resources: [
                 .process("Fixtures")

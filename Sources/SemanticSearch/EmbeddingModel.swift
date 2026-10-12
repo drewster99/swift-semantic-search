@@ -1,12 +1,5 @@
 import Foundation
 
-/// Describes a single embedding model that `SemanticSearchEngine` knows how to load.
-///
-/// A model carries a stable `identifier` (the embedding-output signature — for tagging stored
-/// vectors so callers can detect a swap and re-embed) and the `pooling` strategy its architecture
-/// requires. Models are sourced from a HuggingFace repository, but the host app can also ship a
-/// model inside its bundle (under `bundleSubdirectory`) to skip the first-launch download.
-
 /// How a model's per-token hidden states are reduced to one sentence embedding. This is a property
 /// of the model's architecture — pooling the wrong way silently produces degraded embeddings — so
 /// every `EmbeddingModel` must declare it explicitly, and the backend fails loudly on a strategy it
@@ -20,6 +13,15 @@ public enum PoolingStrategy: String, Sendable, Hashable {
     case cls
 }
 
+/// Describes a single embedding model that `SemanticSearchEngine` knows how to load.
+///
+/// A model carries a stable `identifier` (the embedding-output signature — for tagging stored
+/// vectors so callers can detect a swap and re-embed) and the `pooling` strategy its architecture
+/// requires. Models are sourced from a HuggingFace repository, but the host app can also ship a
+/// model inside its bundle (under `bundleSubdirectory`) to skip the first-launch download.
+///
+/// Only `.lastToken` pooling is implemented by the current backend; a model declaring another
+/// strategy fails at `prepare()` time with `SemanticSearchError.embeddingFailed`.
 public struct EmbeddingModel: Sendable, Hashable {
     /// Stable identifier for the *embedding output* — encodes the model, its quantization, AND
     /// the pooling scheme, so it changes whenever a produced vector would differ. NOT a cache key:
@@ -31,21 +33,24 @@ public struct EmbeddingModel: Sendable, Hashable {
     /// Human-readable name for UI.
     public let displayName: String
 
-    /// Output vector dimension.
+    /// Output vector dimension. Checked against every produced vector; a mismatch throws
+    /// `SemanticSearchError.dimensionMismatch`.
     public let dimension: Int
 
     /// HuggingFace repository, e.g. `"mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"`.
     public let huggingFaceRepo: String
 
     /// Subdirectory inside `Bundle.main` where this model may be found pre-bundled.
-    /// `SemanticSearchEngine` checks this location first; if present, no download
-    /// is required and the model loads from the bundle.
+    /// `SemanticSearchEngine` checks this location first; if it holds `config.json`,
+    /// `tokenizer.json`, `tokenizer_config.json` and at least one `.safetensors` file,
+    /// no download is required and the model loads from the bundle.
     public let bundleSubdirectory: String
 
     /// How the model's per-token hidden states are pooled into one vector. Required — the backend
     /// cannot infer it safely, so adding a model forces this decision. See `PoolingStrategy`.
     public let pooling: PoolingStrategy
 
+    /// Creates a model description. See each property for what the values mean.
     public init(
         identifier: String,
         displayName: String,
